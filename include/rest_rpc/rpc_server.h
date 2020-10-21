@@ -11,47 +11,48 @@
 using boost::asio::ip::tcp;
 
 namespace rest_rpc {
-	namespace rpc_service {        
+	namespace rpc_service {
 		using rpc_conn = std::weak_ptr<connection>;
 		class rpc_server : private asio::noncopyable {
 		public:
-			rpc_server(unsigned short port, size_t size, size_t timeout_seconds = 15, size_t check_seconds = 10)
+			rpc_server(unsigned short port, size_t size, size_t timeout_seconds = 15, size_t check_seconds = 10, std::size_t send_queue_maximum_size = UINT_MAX)
 				: io_service_pool_(size),
 				acceptor_(io_service_pool_.get_io_service(), tcp::endpoint(tcp::v4(), port)),
 				timeout_seconds_(timeout_seconds),
-				check_seconds_(check_seconds) {
+				check_seconds_(check_seconds),
+				send_queue_maximum_size_(send_queue_maximum_size) {
 				do_accept();
 				check_thread_ = std::make_shared<std::thread>([this] { clean(); });
 				pub_sub_thread_ = std::make_shared<std::thread>([this] { clean_sub_pub(); });
 			}
 
-            rpc_server(unsigned short port, size_t size, ssl_configure ssl_conf, size_t timeout_seconds = 15, size_t check_seconds = 10) :
-                rpc_server(port, size, timeout_seconds, check_seconds) {
+			rpc_server(unsigned short port, size_t size, ssl_configure ssl_conf, size_t timeout_seconds = 15, size_t check_seconds = 10) :
+				rpc_server(port, size, timeout_seconds, check_seconds) {
 #ifdef CINATRA_ENABLE_SSL
-                ssl_conf_ = std::move(ssl_conf);
+				ssl_conf_ = std::move(ssl_conf);
 #else
-                assert(false);//please add definition CINATRA_ENABLE_SSL, not allowed coming in this branch
+				assert(false);//please add definition CINATRA_ENABLE_SSL, not allowed coming in this branch
 #endif
-            }
+			}
 
 			~rpc_server() {
 				{
 					std::unique_lock<std::mutex> lock(mtx_);
 					stop_check_ = true;
-					cv_.notify_all();					
+					cv_.notify_all();
 				}
 				check_thread_->join();
 
 				{
 					std::unique_lock<std::mutex> lock(sub_mtx_);
 					stop_check_pub_sub_ = true;
-					sub_cv_.notify_all();					
+					sub_cv_.notify_all();
 				}
 				pub_sub_thread_->join();
 
 				io_service_pool_.stop();
-				if(thd_){
-                    thd_->join();
+				if (thd_) {
+					thd_->join();
 				}
 			}
 
@@ -60,7 +61,7 @@ namespace rest_rpc {
 			}
 
 			void run() {
-                io_service_pool_.run();
+				io_service_pool_.run();
 			}
 
 			template<ExecMode model = ExecMode::sync, typename Function>
@@ -92,16 +93,38 @@ namespace rest_rpc {
 				return token_list_;
 			}
 
+			std::map<int64_t, size_t> get_send_queue_size(std::string key, std::string token = "") const
+			{
+				std::map<int64_t, size_t> send_queue_map;
+				decltype(sub_map_.equal_range(key)) range;
+				{
+					if (sub_map_.empty())
+						return send_queue_map;
+
+					range = sub_map_.equal_range(key + token);
+				}
+				for (auto it = range.first; it != range.second; ++it) {
+					auto conn = it->second.lock();
+					if (conn == nullptr || conn->has_closed()) {
+						continue;
+					}
+
+					auto conn_id = conn->conn_id();
+					auto queue_size = conn->send_queue_size();
+					send_queue_map.emplace(conn_id, queue_size);
+				}
+				return send_queue_map;
+			}
 		private:
 			void do_accept() {
-				conn_.reset(new connection(io_service_pool_.get_io_service(), timeout_seconds_));
+				conn_.reset(new connection(io_service_pool_.get_io_service(), timeout_seconds_, send_queue_maximum_size_));
 				conn_->set_callback([this](std::string key, std::string token, std::weak_ptr<connection> conn) {
 					std::unique_lock<std::mutex> lock(sub_mtx_);
 					sub_map_.emplace(std::move(key) + token, conn);
 					if (!token.empty()) {
 						token_list_.emplace(std::move(token));
-					}					
-				});
+					}
+					});
 
 				acceptor_.async_accept(conn_->socket(), [this](boost::system::error_code ec) {
 					if (ec) {
@@ -109,9 +132,9 @@ namespace rest_rpc {
 					}
 					else {
 #ifdef CINATRA_ENABLE_SSL
-                        if (!ssl_conf_.cert_file.empty()) {
-                            conn_->init_ssl_context(ssl_conf_);
-                        }
+						if (!ssl_conf_.cert_file.empty()) {
+							conn_->init_ssl_context(ssl_conf_);
+						}
 #endif
 						conn_->start();
 						std::unique_lock<std::mutex> lock(mtx_);
@@ -120,7 +143,7 @@ namespace rest_rpc {
 					}
 
 					do_accept();
-				});
+					});
 			}
 
 			void clean() {
@@ -171,7 +194,7 @@ namespace rest_rpc {
 					range = sub_map_.equal_range(key + token);
 				}
 
-				std::shared_ptr<std::string> shared_data = get_shared_data<T>(std::move(data));				
+				std::shared_ptr<std::string> shared_data = get_shared_data<T>(std::move(data));
 				for (auto it = range.first; it != range.second; ++it) {
 					auto conn = it->second.lock();
 					if (conn == nullptr || conn->has_closed()) {
@@ -183,7 +206,7 @@ namespace rest_rpc {
 			}
 
 			template<typename T>
-			typename std::enable_if<std::is_assignable<std::string, T>::value, std::shared_ptr<std::string>>::type 
+			typename std::enable_if<std::is_assignable<std::string, T>::value, std::shared_ptr<std::string>>::type
 				get_shared_data(std::string data) {
 				return std::make_shared<std::string>(std::move(data));
 			}
@@ -219,7 +242,9 @@ namespace rest_rpc {
 			std::shared_ptr<std::thread> pub_sub_thread_;
 			bool stop_check_pub_sub_ = false;
 
-            ssl_configure ssl_conf_;
+			ssl_configure ssl_conf_;
+
+			std::size_t send_queue_maximum_size_;
 		};
 	}  // namespace rpc_service
 }  // namespace rest_rpc
