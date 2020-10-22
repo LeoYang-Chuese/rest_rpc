@@ -30,3 +30,17 @@
 *.exe
 *.out
 *.app
+
+# cmake
+cmake-build-debug
+cmake_install.cmake
+*.cbp
+
+# idea
+.idea/
+
+.DS_Store
+*iml
+target/
+
+build/
